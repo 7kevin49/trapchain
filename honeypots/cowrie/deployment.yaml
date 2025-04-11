@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cowrie
+  namespace: honeypots
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cowrie
+  template:
+    metadata:
+      labels:
+        app: cowrie
+    spec:
+      containers:
+        - name: cowrie
+          image: ghcr.io/cowrie/cowrie:latest
+          ports:
+            - name: ssh-port     # ✅ MUST match Service targetPort
+              containerPort: 2222
+          readinessProbe:
+            tcpSocket:
+              port: 2222
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
+          volumeMounts:
+            - mountPath: /cowrie/log
+              name: cowrie-logs
+      volumes:
+        - name: cowrie-logs
+          emptyDir: {}

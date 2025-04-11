@@ -1,0 +1,21 @@
+config:
+  snippets:
+    extraScrapeConfigs: |
+      - job_name: kubernetes-pods-honeypots
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_namespace]
+            action: keep
+            regex: honeypots
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: cowrie|dionaea
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_container_name]
+            target_label: container
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)

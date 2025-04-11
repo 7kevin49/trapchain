@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dionaea
+  namespace: honeypots
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dionaea
+  template:
+    metadata:
+      labels:
+        app: dionaea
+    spec:
+      containers:
+        - name: dionaea
+          image: dinotools/dionaea:latest
+          ports:
+            - containerPort: 21  # FTP
+            - containerPort: 445 # SMB
+            - containerPort: 135 # RPC
+          volumeMounts:
+            - name: dionaea-logs
+              mountPath: /opt/dionaea/var/log
+      volumes:
+        - name: dionaea-logs
+          emptyDir: {}
