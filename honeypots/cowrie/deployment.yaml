@@ -17,7 +17,7 @@ spec:
         - name: cowrie
           image: ghcr.io/cowrie/cowrie:latest
           ports:
-            - name: ssh-port     # ✅ MUST match Service targetPort
+            - name: ssh-port     # MUST match Service targetPort
               containerPort: 2222
           readinessProbe:
             tcpSocket:
