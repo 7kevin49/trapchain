@@ -23,6 +23,19 @@ spec:
           volumeMounts:
             - name: dionaea-logs
               mountPath: /opt/dionaea/var/log
+        - name: promtail
+          image: grafana/promtail:2.9.2
+          args:
+            - "-config.file=/etc/promtail/promtail.yaml"
+          volumeMounts:
+            - name: dionaea-logs
+              mountPath: /var/log/dionaea
+            - name: promtail-config
+              mountPath: /etc/promtail
+              readOnly: true
       volumes:
         - name: dionaea-logs
           emptyDir: {}
+        - name: promtail-config
+          configMap:
+            name: promtail-dionaea-config
