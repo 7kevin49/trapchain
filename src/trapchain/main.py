@@ -1,13 +1,11 @@
-import os
-import time
+
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+import structlog
 
 from trapchain.graph import pipeline, summarise
-
-import structlog
 
 logger = structlog.get_logger(__name__)
 
@@ -23,7 +21,7 @@ def run_window(
             "start_ns": int(start.timestamp() * 1e9),
             "end_ns": int(now.timestamp() * 1e9),
         },
-        {"recursion_limit": 100}
+        {"recursion_limit": 100},
     )
 
     df = state.get("report") or summarise(state["agg"])

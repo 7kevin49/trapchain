@@ -16,8 +16,6 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 
 from trapchain.settings import CHUNK_SIZE, LOKI_URL, MODEL_NAME, OPENAI_API_KEY
-from trapchain.nodes.nodes import EventState, fetch_logs, chunker, merger, categoriser, consolidate
-from trapchain.utils.utils import summarise
 
 logging.basicConfig(
     format="%(message)s",
@@ -27,9 +25,8 @@ logging.basicConfig(
 
 logger = structlog.get_logger(__name__)
 
-# ────────────────────────────────────────────────────────────────
-# 1. Prompt + LLM
-# ────────────────────────────────────────────────────────────────
+# Prompt and LLM Set Up
+
 _SYSTEM_BLURB = """
 You Are a SOC Analyst Assistant. You can read logs and categorize them into severity levels.
 
@@ -69,12 +66,138 @@ llm = ChatOpenAI(
 categorise_runnable = prompt | llm | StrOutputParser()
 consolidate_prompt = ChatPromptTemplate.from_messages(
     [
-        ("system", "You are a SOC Analyst Assistant. Consolidate the following categorized events into a single JSON list, preserving all fields and grouping related events by actor. Return valid JSON."),
-        ("human", "Events: {events}")
+        (
+            "system",
+            "You are a SOC Analyst Assistant. Consolidate the following categorized events into a single JSON list, preserving all fields and grouping related events by actor. Return valid JSON.",
+        ),
+        ("human", "Events: {events}"),
     ]
 )
 consolidate_runnable = consolidate_prompt | llm | StrOutputParser()
 
+### End of Prompt and LLM Set Up ###
+
+
+# Loki Helpers
+def _query_loki(
+    start_ns: int,
+    end_ns: int,
+    apps: list[str] = ["cowrie", "dionaea"],
+    limit: int = 800,
+):
+    all_results, current_start = [], start_ns
+    app_regex = "|".join(apps)
+    query = f'{{namespace="honeypots", app=~"{app_regex}"}}'
+    while current_start < end_ns:
+        params = {
+            "query": query,
+            "start": str(current_start),
+            "end": str(end_ns),
+            "limit": limit,
+            "direction": "FORWARD",
+        }
+        resp = requests.get(f"{LOKI_URL}/loki/api/v1/query_range", params=params)
+        resp.raise_for_status()
+        result = resp.json().get("data", {}).get("result", [])
+        if not result:
+            break
+        all_results.extend(result)
+        last_entry = result[-1]["values"][-1]
+        current_start = int(last_entry[0]) + 1
+    return all_results
+
+
+def _extract_lines(streams) -> List[str]:
+    lines: List[str] = []
+    for s in streams:
+        for ts, msg in s.get("values", []):
+            ts_iso = datetime.fromtimestamp(int(ts) / 1e9, tzutc()).isoformat()
+            if msg := msg.strip():
+                lines.append(f"[{ts_iso}] {msg}")
+    return lines
+
+
+# State Definition
+class EventState(TypedDict):
+    start_ns: int
+    end_ns: int
+    raw_logs: List[str]
+    chunk: List[str] | None
+    result: List[Dict[str, Any]] | None
+    agg: List[Any]
+
+
+# Graph Nodes
+def fetch_logs(state: EventState) -> EventState:
+    streams = _query_loki(state["start_ns"], state["end_ns"])
+    state["raw_logs"] = _extract_lines(streams)
+    state["agg"] = []
+    logger.info(f"[FetchLogs] pulled {len(state['raw_logs'])} lines")
+    return state
+
+
+def chunker(state: EventState) -> EventState:
+    if not state["raw_logs"]:
+        state["chunk"] = None
+        return state
+    state["chunk"] = state["raw_logs"][:CHUNK_SIZE]
+    state["raw_logs"] = state["raw_logs"][CHUNK_SIZE:]
+    logger.info(
+        f"[Chunker] emitting {len(state['chunk'])} lines ({len(state['raw_logs'])} left)"
+    )
+    return state
+
+
+def categoriser(state: EventState) -> EventState:
+    if state["chunk"] is None:
+        return state
+    joined = (
+        "\n".join(state["chunk"])
+        if isinstance(state["chunk"], list)
+        else state["chunk"]
+    )
+    raw_txt = categorise_runnable.invoke({"logs": joined}).strip()
+    cleaned = raw_txt.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("```")[-2]
+    try:
+        parsed = json.loads(cleaned)
+    except Exception:
+        parsed = [
+            {
+                "severity": "UNKNOWN",
+                "action": "investigate",
+                "logs": state["chunk"],
+                "context": "",
+                "source": "",
+                "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "technique": "",
+            }
+        ]
+    state["result"] = parsed
+    for entry in parsed:
+        logger.info(f"[Categoriser] → {entry.get('severity', 'UNKNOWN')}")
+    return state
+
+
+def merger(state: EventState) -> EventState:
+    if state.get("result"):
+        state["agg"].append(state["result"])
+    return state
+
+
+def consolidate(state: EventState) -> EventState:
+    flat = [entry for chunk in state.get("agg", []) for entry in chunk]
+    raw = consolidate_runnable.invoke({"events": json.dumps(flat)})
+    try:
+        state["agg"] = [json.loads(raw)]
+    except Exception:
+        state["agg"] = [flat]
+    return state
+
+### End of Graph Nodes ###
+
+# Builds the pipeline
 def compile_pipeline():
     g = StateGraph(EventState)
     g.add_node("fetch", fetch_logs)
@@ -102,5 +225,42 @@ def compile_pipeline():
 
     return g.compile()
 
+
 pipeline = compile_pipeline()
 
+
+# Summary Helper
+def summarise(aggregate: List[Any]) -> pd.DataFrame:
+    # Handle possible dict-of-groups at top level
+    groups: List[Dict[str, Any]] = []
+    for item in aggregate:
+        if isinstance(item, dict) and all(
+            isinstance(k, str) and k.isdigit() for k in item.keys()
+        ):
+            groups.extend(item.values())
+        elif isinstance(item, list):
+            groups.extend(item)
+        else:
+            groups.append(item)
+
+    rows: List[Dict[str, Any]] = []
+    for group in groups:
+        if isinstance(group, dict):
+            actor = group.get("actor")
+            events = group.get("events")
+            if isinstance(events, list):
+                for ev in events:
+                    row = {**ev}
+                    if actor is not None:
+                        row["actor"] = actor
+                    rows.append(row)
+            else:
+                row = {**group}
+                if actor is not None:
+                    row["actor"] = actor
+                rows.append(row)
+        else:
+            logger.warning("Unexpected group format", group=group)
+
+    df = pd.DataFrame(rows)
+    return df
